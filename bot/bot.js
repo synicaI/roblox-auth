@@ -4,7 +4,7 @@ const {
   SlashCommandBuilder, PermissionFlagsBits,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle,
-  AttachmentBuilder,
+  AttachmentBuilder, EmbedBuilder,
 } = require('discord.js');
 const crypto = require('crypto');
 const path = require('path');
@@ -181,7 +181,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (commandName === 'listkeys') {
       const { rows } = await pool.query(
-        `SELECT key_value, hwid, expires_at FROM keys ORDER BY created_at DESC`
+        `SELECT key_value, hwid, discord_id, expires_at FROM keys ORDER BY created_at DESC`
       );
 
       if (!rows.length) {
@@ -191,7 +191,8 @@ client.on('interactionCreate', async (interaction) => {
       const lines = rows.map(r => {
         const status = new Date(r.expires_at) < new Date() ? 'EXPIRED' : 'active';
         const hwid = r.hwid ? `\`${r.hwid}\`` : '*not locked yet*';
-        return `\`${r.key_value}\` — hwid: ${hwid} — ${status} (until ${new Date(r.expires_at).toISOString().slice(0, 10)})`;
+        const owner = r.discord_id ? `<@${r.discord_id}>` : '*unclaimed*';
+        return `\`${r.key_value}\` — owner: ${owner} — hwid: ${hwid} — ${status} (until ${new Date(r.expires_at).toISOString().slice(0, 10)})`;
       });
 
       // Discord messages cap at ~2000 chars — chunk into multiple messages if needed
@@ -215,14 +216,16 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (commandName === 'panel') {
+      const embed = new EmbedBuilder()
+        .setTitle('License Panel')
+        .setDescription('Click **Get Role** and enter your license key to unlock access, then **Get Script** to receive the file.')
+        .setColor(0x5865F2);
+
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('get_role').setLabel('Get Role').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('get_script').setLabel('Get Script').setStyle(ButtonStyle.Success),
       );
-      await interaction.channel.send({
-        content: '**License Panel**\nClick **Get Role** and enter your license key to unlock access, then **Get Script** to receive the file.',
-        components: [row],
-      });
+      await interaction.channel.send({ embeds: [embed], components: [row] });
       return interaction.reply({ content: 'Panel posted.', ephemeral: true });
     }
   } catch (err) {
