@@ -2,15 +2,21 @@
 const {
   Client, GatewayIntentBits, REST, Routes,
   SlashCommandBuilder, PermissionFlagsBits,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  ModalBuilder, TextInputBuilder, TextInputStyle,
+  AttachmentBuilder,
 } = require('discord.js');
 const crypto = require('crypto');
+const path = require('path');
 const { pool, initSchema } = require('../db');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;       // for fast guild-scoped command registration
-const ALLOWED_ROLE_ID = process.env.ALLOWED_ROLE_ID; // role permitted to run these commands
-const ALLOWED_CHANNEL_ID = process.env.ALLOWED_CHANNEL_ID; // channel these commands work in
+const ALLOWED_ROLE_ID = process.env.ALLOWED_ROLE_ID; // role permitted to run admin commands
+const ALLOWED_CHANNEL_ID = process.env.ALLOWED_CHANNEL_ID; // channel admin commands work in
+const LICENSE_ROLE_ID = process.env.LICENSE_ROLE_ID; // role granted once a valid key is entered
+const SCRIPT_FILE_PATH = process.env.SCRIPT_FILE_PATH || path.join(__dirname, '..', 'assets', 'script.lua');
 
 const commands = [
   new SlashCommandBuilder()
@@ -33,6 +39,9 @@ const commands = [
   new SlashCommandBuilder()
     .setName('listkeys')
     .setDescription('List all keys and the HWID they are locked to'),
+  new SlashCommandBuilder()
+    .setName('panel')
+    .setDescription('Post the Get Role / Get Script button panel in this channel'),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -56,6 +65,72 @@ function isAllowed(interaction) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.on('interactionCreate', async (interaction) => {
+  // --- Panel buttons (public, anyone in the server can click) ---
+  if (interaction.isButton()) {
+    if (interaction.customId === 'get_role') {
+      const modal = new ModalBuilder()
+        .setCustomId('key_modal')
+        .setTitle('Enter your license key');
+
+      const keyInput = new TextInputBuilder()
+        .setCustomId('key_input')
+        .setLabel('License key')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(keyInput));
+      return interaction.showModal(modal);
+    }
+
+    if (interaction.customId === 'get_script') {
+      try {
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        if (!member.roles.cache.has(LICENSE_ROLE_ID)) {
+          return interaction.reply({ content: 'You need a valid license role to get the script. Click **Get Role** first.', ephemeral: true });
+        }
+        const attachment = new AttachmentBuilder(SCRIPT_FILE_PATH);
+        return interaction.reply({ content: 'Here is your script:', files: [attachment], ephemeral: true });
+      } catch (err) {
+        console.error('Error sending script:', err);
+        return interaction.reply({ content: 'Could not send the script file. Contact an admin.', ephemeral: true });
+      }
+    }
+    return;
+  }
+
+  // --- Key modal submission ---
+  if (interaction.isModalSubmit() && interaction.customId === 'key_modal') {
+    const key = interaction.fields.getTextInputValue('key_input').trim();
+
+    try {
+      const { rows } = await pool.query('SELECT * FROM keys WHERE key_value = $1', [key]);
+      const row = rows[0];
+
+      if (!row) {
+        return interaction.reply({ content: 'Invalid key.', ephemeral: true });
+      }
+      if (new Date(row.expires_at) < new Date()) {
+        return interaction.reply({ content: 'This key has expired.', ephemeral: true });
+      }
+      if (row.discord_id && row.discord_id !== interaction.user.id) {
+        return interaction.reply({ content: 'This key is already linked to another Discord account.', ephemeral: true });
+      }
+
+      if (!row.discord_id) {
+        await pool.query('UPDATE keys SET discord_id = $1 WHERE id = $2', [interaction.user.id, row.id]);
+      }
+
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      await member.roles.add(LICENSE_ROLE_ID);
+
+      return interaction.reply({ content: 'Key valid! Role granted — you can now click **Get Script**.', ephemeral: true });
+    } catch (err) {
+      console.error('Error validating key:', err);
+      return interaction.reply({ content: 'Something went wrong validating your key.', ephemeral: true });
+    }
+  }
+
+  // --- Admin slash commands (role + channel restricted) ---
   if (!interaction.isChatInputCommand()) return;
 
   if (!isAllowed(interaction)) {
@@ -137,6 +212,18 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.followUp({ content: chunks[i], ephemeral: true });
       }
       return;
+    }
+
+    if (commandName === 'panel') {
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('get_role').setLabel('Get Role').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('get_script').setLabel('Get Script').setStyle(ButtonStyle.Success),
+      );
+      await interaction.channel.send({
+        content: '**License Panel**\nClick **Get Role** and enter your license key to unlock access, then **Get Script** to receive the file.',
+        components: [row],
+      });
+      return interaction.reply({ content: 'Panel posted.', ephemeral: true });
     }
   } catch (err) {
     console.error(err);
