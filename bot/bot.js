@@ -30,6 +30,9 @@ const commands = [
     .setName('revokekey')
     .setDescription('Delete a key')
     .addStringOption(o => o.setName('key').setDescription('The key').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('listkeys')
+    .setDescription('List all keys and the HWID they are locked to'),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -99,6 +102,41 @@ client.on('interactionCreate', async (interaction) => {
       const { rowCount } = await pool.query(`DELETE FROM keys WHERE key_value = $1`, [key]);
       if (!rowCount) return interaction.reply({ content: 'Key not found.', ephemeral: true });
       return interaction.reply({ content: `Key \`${key}\` revoked.`, ephemeral: true });
+    }
+
+    if (commandName === 'listkeys') {
+      const { rows } = await pool.query(
+        `SELECT key_value, hwid, expires_at FROM keys ORDER BY created_at DESC`
+      );
+
+      if (!rows.length) {
+        return interaction.reply({ content: 'No keys found.', ephemeral: true });
+      }
+
+      const lines = rows.map(r => {
+        const status = new Date(r.expires_at) < new Date() ? 'EXPIRED' : 'active';
+        const hwid = r.hwid ? `\`${r.hwid}\`` : '*not locked yet*';
+        return `\`${r.key_value}\` — hwid: ${hwid} — ${status} (until ${new Date(r.expires_at).toISOString().slice(0, 10)})`;
+      });
+
+      // Discord messages cap at ~2000 chars — chunk into multiple messages if needed
+      const chunks = [];
+      let current = '';
+      for (const line of lines) {
+        if ((current + '\n' + line).length > 1900) {
+          chunks.push(current);
+          current = line;
+        } else {
+          current = current ? current + '\n' + line : line;
+        }
+      }
+      if (current) chunks.push(current);
+
+      await interaction.reply({ content: chunks[0], ephemeral: true });
+      for (let i = 1; i < chunks.length; i++) {
+        await interaction.followUp({ content: chunks[i], ephemeral: true });
+      }
+      return;
     }
   } catch (err) {
     console.error(err);
