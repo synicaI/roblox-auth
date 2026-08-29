@@ -144,9 +144,9 @@ client.on('interactionCreate', async (interaction) => {
       const duration = options.getInteger('duration');
       const key = genKey();
       await pool.query(
-        `INSERT INTO keys (key_value, discord_id, expires_at)
-         VALUES ($1, $2, NOW() + ($3 || ' days')::interval)`,
-        [key, interaction.user.id, duration]
+        `INSERT INTO keys (key_value, expires_at)
+         VALUES ($1, NOW() + ($2 || ' days')::interval)`,
+        [key, duration]
       );
       return interaction.reply({ content: `Key created: \`${key}\` (valid ${duration} days)`, ephemeral: true });
     }
