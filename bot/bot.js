@@ -217,7 +217,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (commandName === 'panel') {
       const embed = new EmbedBuilder()
-        .setTitle('License Panel')
+        .setTitle('Ibuprofen user panel')
         .setDescription('Click **Get Role** and enter your license key to unlock access, then **Get Script** to receive the file.')
         .setColor(0x5865F2);
 
