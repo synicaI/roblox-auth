@@ -1,0 +1,13 @@
+{
+  "name": "roblox-auth",
+  "version": "1.0.0",
+  "scripts": {
+    "start:api": "node api/server.js",
+    "start:bot": "node bot/bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "express": "^4.19.2",
+    "pg": "^8.11.5"
+  }
+}
