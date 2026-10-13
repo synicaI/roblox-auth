@@ -1,6 +1,7 @@
 // api/server.js — the API your Roblox script calls
 const express = require('express');
 const { pool, initSchema } = require('../db');
+const { logEvent, clean } = require('../log');
 
 const app = express();
 app.use(express.json());
@@ -24,10 +25,18 @@ app.post('/verify', async (req, res) => {
     const row = rows[0];
 
     if (!row) {
+      logEvent(
+        `**[VERIFY FAILED]** invalid key \`${clean(key)}\` — hwid \`${clean(hwid)}\``,
+        `invalid:${key}:${hwid}`
+      );
       return res.status(404).json({ ok: false, reason: 'invalid_key' });
     }
 
     if (new Date(row.expires_at) < new Date()) {
+      logEvent(
+        `**[VERIFY FAILED]** expired key \`${clean(key)}\` — hwid \`${clean(hwid)}\``,
+        `expired:${key}:${hwid}`
+      );
       return res.status(403).json({ ok: false, reason: 'expired' });
     }
 
@@ -38,6 +47,10 @@ app.post('/verify', async (req, res) => {
     }
 
     if (row.hwid !== hwid) {
+      logEvent(
+        `**[VERIFY FAILED]** HWID mismatch on key \`${clean(key)}\` — attempted hwid \`${clean(hwid)}\``,
+        `mismatch:${key}:${hwid}`
+      );
       return res.status(403).json({ ok: false, reason: 'hwid_mismatch' });
     }
 
