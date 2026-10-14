@@ -21,11 +21,13 @@ const SCRIPT_FILE_PATH = process.env.SCRIPT_FILE_PATH || path.join(__dirname, '.
 const RESET_COOLDOWN_DAYS = parseInt(process.env.HWID_RESET_COOLDOWN_DAYS, 10) || 7; // self-service HWID reset cooldown
 const RENEW_URL = process.env.RENEW_URL || '';             // optional link shown in expiry reminder DMs
 const REMINDER_DAYS = 3;
+const SERVER_INVITE = process.env.SERVER_INVITE || 'https://discord.gg/uTEs99V6qE';
+const NEED_KEY_MSG = 'You need an active key to use this. Use **/redeem** to link one.';
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;            // hourly
 
 const unix = (d) => Math.floor(new Date(d).getTime() / 1000);
 
-const commands = [
+const adminCommands = [
   new SlashCommandBuilder()
     .setName('addkey')
     .setDescription('Generate a new license key')
@@ -51,12 +53,45 @@ const commands = [
     .setDescription('Post the license button panel in this channel'),
 ].map(c => c.toJSON());
 
+// Commands usable anywhere (servers, DMs, group DMs) once the app is installed on a user's account.
+// integration_types: 0 = guild install, 1 = user install | contexts: 0 = guild, 1 = bot DM, 2 = other DMs/group DMs
+const userCommandBuilders = [
+  new SlashCommandBuilder()
+    .setName('public')
+    .setDescription('Choose if the bot replies only to you or in public chat')
+    .addBooleanOption(o => o.setName('enabled').setDescription('true = everyone can see replies, false = only you').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('redeem')
+    .setDescription('Redeem your license key to whitelist your Discord account'),
+  new SlashCommandBuilder()
+    .setName('stats')
+    .setDescription('Show your license stats'),
+  new SlashCommandBuilder()
+    .setName('information')
+    .setDescription('FAQ and pricing'),
+  new SlashCommandBuilder()
+    .setName('script')
+    .setDescription('Get the script (requires an active key)'),
+  new SlashCommandBuilder()
+    .setName('hwid-reset')
+    .setDescription('Reset your HWID (cooldown applies)'),
+  new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('Get the support server invite'),
+];
+const userCommands = userCommandBuilders.map(c => ({
+  ...c.toJSON(),
+  integration_types: [0, 1],
+  contexts: [0, 1, 2],
+}));
+const USER_COMMAND_NAMES = new Set(userCommandBuilders.map(c => c.name));
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(
-    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-    { body: commands }
-  );
+  // admin commands stay private to your server
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: adminCommands });
+  // user commands are global so they work everywhere
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: userCommands });
   console.log('Slash commands registered.');
 }
 
@@ -113,6 +148,175 @@ async function hasActiveKey(discordId) {
     [discordId]
   );
   return rows.length > 0;
+}
+
+// ---------- shared key logic (used by the panel and the user commands) ----------
+
+// Validates a key and links it to a Discord account (atomic, so two people can't claim it at once)
+async function claimKey(userId, key) {
+  const { rows } = await pool.query('SELECT * FROM keys WHERE key_value = $1', [key]);
+  const row = rows[0];
+
+  if (!row) return { ok: false, message: 'Invalid key.' };
+  if (new Date(row.expires_at) < new Date()) return { ok: false, message: 'This key has expired.' };
+  if (row.discord_id && row.discord_id !== userId) {
+    return { ok: false, message: 'This key is already linked to another Discord account.' };
+  }
+
+  const firstClaim = !row.discord_id;
+  if (firstClaim) {
+    const result = await pool.query(
+      'UPDATE keys SET discord_id = $1 WHERE id = $2 AND discord_id IS NULL',
+      [userId, row.id]
+    );
+    if (!result.rowCount) {
+      return { ok: false, message: 'This key is already linked to another Discord account.' };
+    }
+  }
+  return { ok: true, firstClaim, row };
+}
+
+// The account's active (non-expired) key with the latest expiry, plus HWID-reset availability
+async function getActiveKey(userId) {
+  const { rows } = await pool.query(
+    `SELECT id, key_value, hwid, expires_at,
+            (last_hwid_reset IS NULL OR last_hwid_reset + ($2 || ' days')::interval <= NOW()) AS can_reset,
+            last_hwid_reset + ($2 || ' days')::interval AS available_at
+     FROM keys
+     WHERE discord_id = $1 AND expires_at > NOW()
+     ORDER BY expires_at DESC LIMIT 1`,
+    [userId, String(RESET_COOLDOWN_DAYS)]
+  );
+  return rows[0] || null;
+}
+
+async function selfResetHwid(userId) {
+  const row = await getActiveKey(userId);
+  if (!row) return { ok: false, content: NEED_KEY_MSG };
+  if (!row.hwid) return { ok: false, content: 'Your HWID is not locked yet, there is nothing to reset.' };
+  if (!row.can_reset) {
+    return { ok: false, content: `You can reset your HWID again <t:${unix(row.available_at)}:R>.` };
+  }
+
+  // atomic update so a double click can't bypass the cooldown
+  const result = await pool.query(
+    `UPDATE keys SET hwid = NULL, last_hwid_reset = NOW()
+     WHERE id = $1 AND hwid IS NOT NULL
+       AND (last_hwid_reset IS NULL OR last_hwid_reset + ($2 || ' days')::interval <= NOW())`,
+    [row.id, String(RESET_COOLDOWN_DAYS)]
+  );
+  if (!result.rowCount) return { ok: false, content: 'Reset is not available right now.' };
+
+  logEvent(`**[HWID RESET]** <@${userId}> reset their own HWID — key \`${row.key_value}\``);
+  return {
+    ok: true,
+    content: `Your HWID has been reset. You can do this again in ${RESET_COOLDOWN_DAYS} days. Run the script to lock it to your new device.`,
+  };
+}
+
+// ---------- user commands (work everywhere the app is installed) ----------
+
+// Per-user "public" setting: private (ephemeral) by default
+async function visibility(userId) {
+  const { rows } = await pool.query('SELECT public_replies FROM user_settings WHERE discord_id = $1', [userId]);
+  return rows[0]?.public_replies ? {} : { ephemeral: true };
+}
+
+const maskKey = (k) => `${k.slice(0, 4)}…${k.slice(-4)}`;
+
+function buildInfoEmbed() {
+  return new EmbedBuilder()
+    .setTitle('FAQ')
+    .setColor(0x5865F2)
+    .setDescription(
+      'Ibuprofen is a Roblox Luau script made for closet cheating. It supports multiple Da Hood remakes, such as Voidfalls\' games, Hood Customs, Dee Hood, Dea Hood and Hood Modded.\n\n' +
+      'To protect your private data, Ibuprofen only stores your HWID, your license key and the Discord account linked to it, which is used to prevent key sharing.\n\n' +
+      'Ibuprofen works with most executors, but some may crash on the first execution.'
+    )
+    .addFields(
+      { name: 'Pricing', value: '• 7-Day License — €1\n• 30-Day License — €2\n• Lifetime License — €3' },
+      { name: 'More questions?', value: 'Make a ticket in our Discord server. Use **/help** to get the invite.' },
+    );
+}
+
+async function handleUserCommand(interaction) {
+  const userId = interaction.user.id;
+  const name = interaction.commandName;
+
+  try {
+    // Open to everyone
+    if (name === 'redeem') {
+      // A modal (instead of a command option) so the key is never shown in chat
+      const modal = new ModalBuilder().setCustomId('redeem_modal').setTitle('Redeem your license key');
+      const keyInput = new TextInputBuilder()
+        .setCustomId('key_input')
+        .setLabel('License key')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(keyInput));
+      return await interaction.showModal(modal);
+    }
+
+    if (name === 'public') {
+      const enabled = interaction.options.getBoolean('enabled');
+      await pool.query(
+        `INSERT INTO user_settings (discord_id, public_replies) VALUES ($1, $2)
+         ON CONFLICT (discord_id) DO UPDATE SET public_replies = EXCLUDED.public_replies`,
+        [userId, enabled]
+      );
+      return interaction.reply({
+        content: enabled
+          ? 'Public replies enabled: my replies will be visible to everyone in the chat. `/script` and `/redeem` always stay private.'
+          : 'Public replies disabled: only you can see my replies.',
+        ephemeral: true,
+      });
+    }
+
+    if (name === 'information') {
+      return interaction.reply({ embeds: [buildInfoEmbed()], ...(await visibility(userId)) });
+    }
+
+    if (name === 'help') {
+      return interaction.reply({ content: `Need help? Join the server and make a ticket: ${SERVER_INVITE}`, ...(await visibility(userId)) });
+    }
+
+    // Everything below needs an active key linked to this account (revoked/expired => blocked until a new redeem)
+    const key = await getActiveKey(userId);
+    if (!key) return interaction.reply({ content: NEED_KEY_MSG, ephemeral: true });
+
+    if (name === 'script') {
+      // always private: a public reply would let everyone in the channel download the script
+      const attachment = new AttachmentBuilder(SCRIPT_FILE_PATH);
+      return interaction.reply({ content: 'Here is your script:', files: [attachment], ephemeral: true });
+    }
+
+    if (name === 'hwid-reset') {
+      const result = await selfResetHwid(userId);
+      return interaction.reply({ content: result.content, ...(await visibility(userId)) });
+    }
+
+    if (name === 'stats') {
+      let resetText = 'Available now';
+      if (!key.hwid) resetText = 'Nothing to reset';
+      else if (!key.can_reset) resetText = `Available <t:${unix(key.available_at)}:R>`;
+
+      const embed = new EmbedBuilder()
+        .setTitle('Your stats')
+        .setColor(0x5865F2)
+        .addFields(
+          // key is masked and HWID never shown, since replies can be public
+          { name: 'Key', value: `\`${maskKey(key.key_value)}\``, inline: true },
+          { name: 'Status', value: 'Active', inline: true },
+          { name: 'Expires', value: `<t:${unix(key.expires_at)}:F> (<t:${unix(key.expires_at)}:R>)` },
+          { name: 'HWID', value: key.hwid ? 'Locked' : 'Not locked yet', inline: true },
+          { name: 'HWID reset', value: resetText, inline: true },
+        );
+      return interaction.reply({ embeds: [embed], ...(await visibility(userId)) });
+    }
+  } catch (err) {
+    console.error('User command error:', err);
+    return safeReply(interaction, { content: 'Something went wrong. Contact an admin.', ephemeral: true });
+  }
 }
 
 // ---------- hourly maintenance: expiry role removal + reminders ----------
@@ -211,41 +415,8 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (interaction.customId === 'reset_hwid') {
-        const { rows } = await pool.query(
-          `SELECT id, key_value, hwid,
-                  (last_hwid_reset IS NULL OR last_hwid_reset + ($2 || ' days')::interval <= NOW()) AS can_reset,
-                  last_hwid_reset + ($2 || ' days')::interval AS available_at
-           FROM keys
-           WHERE discord_id = $1 AND expires_at > NOW()
-           ORDER BY expires_at DESC LIMIT 1`,
-          [interaction.user.id, String(RESET_COOLDOWN_DAYS)]
-        );
-        const row = rows[0];
-        if (!row) {
-          return interaction.reply({ content: 'You have no active key linked to your account.', ephemeral: true });
-        }
-        if (!row.hwid) {
-          return interaction.reply({ content: 'Your HWID is not locked yet, there is nothing to reset.', ephemeral: true });
-        }
-        if (!row.can_reset) {
-          return interaction.reply({ content: `You can reset your HWID again <t:${unix(row.available_at)}:R>.`, ephemeral: true });
-        }
-
-        // atomic update so a double click can't bypass the cooldown
-        const result = await pool.query(
-          `UPDATE keys SET hwid = NULL, last_hwid_reset = NOW()
-           WHERE id = $1 AND hwid IS NOT NULL
-             AND (last_hwid_reset IS NULL OR last_hwid_reset + ($2 || ' days')::interval <= NOW())`,
-          [row.id, String(RESET_COOLDOWN_DAYS)]
-        );
-        if (!result.rowCount) {
-          return interaction.reply({ content: 'Reset is not available right now.', ephemeral: true });
-        }
-        logEvent(`**[HWID RESET]** <@${interaction.user.id}> reset their own HWID — key \`${row.key_value}\``);
-        return interaction.reply({
-          content: `Your HWID has been reset. You can do this again in ${RESET_COOLDOWN_DAYS} days. Run the script to lock it to your new device.`,
-          ephemeral: true,
-        });
+        const result = await selfResetHwid(interaction.user.id);
+        return interaction.reply({ content: result.content, ephemeral: true });
       }
     } catch (err) {
       console.error('Button error:', err);
@@ -254,40 +425,50 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  // --- Key modal submission ---
+  // --- Key modal submission (panel: Get Role) ---
   if (interaction.isModalSubmit() && interaction.customId === 'key_modal') {
     const key = interaction.fields.getTextInputValue('key_input').trim();
 
     try {
-      const { rows } = await pool.query('SELECT * FROM keys WHERE key_value = $1', [key]);
-      const row = rows[0];
-
-      if (!row) {
-        return interaction.reply({ content: 'Invalid key.', ephemeral: true });
-      }
-      if (new Date(row.expires_at) < new Date()) {
-        return interaction.reply({ content: 'This key has expired.', ephemeral: true });
-      }
-      if (row.discord_id && row.discord_id !== interaction.user.id) {
-        return interaction.reply({ content: 'This key is already linked to another Discord account.', ephemeral: true });
-      }
-
-      const firstClaim = !row.discord_id;
-      if (firstClaim) {
-        await pool.query('UPDATE keys SET discord_id = $1 WHERE id = $2', [interaction.user.id, row.id]);
-      }
+      const result = await claimKey(interaction.user.id, key);
+      if (!result.ok) return interaction.reply({ content: result.message, ephemeral: true });
 
       const member = await interaction.guild.members.fetch(interaction.user.id);
       await member.roles.add(LICENSE_ROLE_ID);
 
-      if (firstClaim) {
-        logEvent(`**[KEY CLAIMED]** \`${row.key_value}\` claimed by <@${interaction.user.id}>`);
+      if (result.firstClaim) {
+        logEvent(`**[KEY CLAIMED]** \`${result.row.key_value}\` claimed by <@${interaction.user.id}>`);
       }
       return interaction.reply({ content: 'Key valid! Role granted — you can now click **Get Script**.', ephemeral: true });
     } catch (err) {
       console.error('Error validating key:', err);
       return safeReply(interaction, { content: 'Something went wrong validating your key.', ephemeral: true });
     }
+  }
+
+  // --- Key modal submission (/redeem, works in DMs and any server) ---
+  if (interaction.isModalSubmit() && interaction.customId === 'redeem_modal') {
+    const key = interaction.fields.getTextInputValue('key_input').trim();
+
+    try {
+      const result = await claimKey(interaction.user.id, key);
+      if (!result.ok) return interaction.reply({ content: result.message, ephemeral: true });
+
+      await addLicenseRole(interaction.user.id); // best effort, only works if they're in your server
+
+      if (result.firstClaim) {
+        logEvent(`**[KEY CLAIMED]** \`${result.row.key_value}\` redeemed by <@${interaction.user.id}> via /redeem`);
+      }
+      return interaction.reply({ content: 'Key redeemed! Your Discord account is now whitelisted. Use **/script** to get the script.', ephemeral: true });
+    } catch (err) {
+      console.error('Error redeeming key:', err);
+      return safeReply(interaction, { content: 'Something went wrong redeeming your key.', ephemeral: true });
+    }
+  }
+
+  // --- User commands (anyone with the app installed) ---
+  if (interaction.isChatInputCommand() && USER_COMMAND_NAMES.has(interaction.commandName)) {
+    return handleUserCommand(interaction);
   }
 
   // --- Admin slash commands (role + channel restricted) ---
