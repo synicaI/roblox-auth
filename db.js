@@ -6,29 +6,34 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false,
 });
 
+// Safe to run on every start. Retried because the API and the bot both run it at boot
+// and could collide on the same CREATE/ALTER.
 async function initSchema() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS keys (
-      id SERIAL PRIMARY KEY,
-      key_value TEXT UNIQUE NOT NULL,
-      hwid TEXT,
-      discord_id TEXT,
-      expires_at TIMESTAMP NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // New columns (safe to run on every start). Retry because the API and the bot
-  // both run this at boot and could collide on the ALTER.
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS keys (
+          id SERIAL PRIMARY KEY,
+          key_value TEXT UNIQUE NOT NULL,
+          hwid TEXT,
+          discord_id TEXT,
+          expires_at TIMESTAMP NOT NULL,
+          created_at TIMESTAMP DEFAULT NOW()
+        );
+      `);
       await pool.query(`
         ALTER TABLE keys
           ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN NOT NULL DEFAULT FALSE,
           ADD COLUMN IF NOT EXISTS role_removed BOOLEAN NOT NULL DEFAULT FALSE,
           ADD COLUMN IF NOT EXISTS last_hwid_reset TIMESTAMP;
       `);
-      break;
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS user_settings (
+          discord_id TEXT PRIMARY KEY,
+          public_replies BOOLEAN NOT NULL DEFAULT FALSE
+        );
+      `);
+      return;
     } catch (err) {
       if (attempt === 3) throw err;
       await new Promise((r) => setTimeout(r, 1000));
