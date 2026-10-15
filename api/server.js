@@ -3,6 +3,9 @@ const express = require('express');
 const { pool, initSchema } = require('../db');
 const { logEvent, clean } = require('../log');
 
+// used by the bot's status monitor; it should never show up in the failed-verify logs
+const PROBE_KEY = '__status_probe__';
+
 const app = express();
 app.use(express.json());
 
@@ -25,7 +28,7 @@ app.post('/verify', async (req, res) => {
     const row = rows[0];
 
     if (!row) {
-      logEvent(
+      if (key !== PROBE_KEY) logEvent(
         `**[VERIFY FAILED]** invalid key \`${clean(key)}\` — hwid \`${clean(hwid)}\``,
         `invalid:${key}:${hwid}`
       );
