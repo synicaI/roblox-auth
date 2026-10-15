@@ -4,6 +4,8 @@ const { Pool } = require('pg');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // Railway injects this automatically
   ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 10000, // fail fast instead of hanging when the database is unreachable
+  query_timeout: 15000,
 });
 
 // Safe to run on every start. Retried because the API and the bot both run it at boot
@@ -31,6 +33,24 @@ async function initSchema() {
         CREATE TABLE IF NOT EXISTS user_settings (
           discord_id TEXT PRIMARY KEY,
           public_replies BOOLEAN NOT NULL DEFAULT FALSE
+        );
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS status_checks (
+          id SERIAL PRIMARY KEY,
+          service TEXT NOT NULL,
+          ok BOOLEAN NOT NULL,
+          latency_ms INTEGER,
+          checked_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS status_checks_checked_at_idx ON status_checks (checked_at);
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS bot_state (
+          k TEXT PRIMARY KEY,
+          v TEXT
         );
       `);
       return;
