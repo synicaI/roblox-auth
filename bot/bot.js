@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const path = require('path');
 const { pool, initSchema } = require('../db');
 const { logEvent } = require('../log');
+const { startStatusMonitor } = require('./status');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -610,4 +611,7 @@ client.on('interactionCreate', async (interaction) => {
   // first run shortly after login, then every hour
   setTimeout(runMaintenance, 15_000);
   setInterval(runMaintenance, MAINTENANCE_INTERVAL_MS);
+
+  // status embed in the status channel every 15 minutes
+  startStatusMonitor(client);
 })();
