@@ -4,7 +4,7 @@ const { EmbedBuilder } = require('discord.js');
 const { pool } = require('../db');
 
 const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID || '1559938680725049424';
-const API_URL = (process.env.API_URL || 'https://happy-charm-production-7465.up.railway.app').replace(/\/+$/, '');
+const API_URL = (process.env.API_URL || 'https://practical-analysis-production-df21.up.railway.app').replace(/\/+$/, '');
 const INTERVAL_MS = 15 * 60 * 1000;
 const CHECK_TIMEOUT_MS = 8000;
 const RETENTION_DAYS = 30; // uptime is computed over this window
