@@ -53,6 +53,9 @@ const adminCommands = [
     .setName('listkeys')
     .setDescription('List all keys and the HWID they are locked to'),
   new SlashCommandBuilder()
+    .setName('anc')
+    .setDescription('Send an announcement by DM to every whitelisted user'),
+  new SlashCommandBuilder()
     .setName('panel')
     .setDescription('Post the license button panel in this channel'),
 ].map(c => c.toJSON());
@@ -627,12 +630,172 @@ async function changelogPage(userId, index) {
   return { embeds: [embed], components: [row] };
 }
 
+// ---------- /anc: announcement DM to every whitelisted user ----------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ANC_DELAY_MS = 1000; // pause between DMs to stay well under Discord's rate limits
+const pendingAnnouncements = new Map(); // draft id -> { title, text, userId, createdAt }
+let announcing = false;
+
+// Only members holding ALLOWED_ROLE_ID in the server
+function isAnnouncer(interaction) {
+  const roles = interaction.member && interaction.member.roles;
+  if (!roles) return false;
+  return roles.cache ? roles.cache.has(ALLOWED_ROLE_ID) : Array.isArray(roles) && roles.includes(ALLOWED_ROLE_ID);
+}
+
+// "Whitelisted" = a Discord account linked to a key that hasn't expired (one DM per person)
+async function getAnnouncementRecipients() {
+  const { rows } = await pool.query(
+    'SELECT DISTINCT discord_id FROM keys WHERE discord_id IS NOT NULL AND expires_at > NOW()'
+  );
+  return rows.map((r) => r.discord_id);
+}
+
+function buildAnnouncementEmbed(title, text) {
+  return new EmbedBuilder()
+    .setTitle(title || 'Announcement')
+    .setDescription(text)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'Ibuprofen announcement' })
+    .setTimestamp();
+}
+
+// Step 1: /anc opens the form
+async function handleAncCommand(interaction) {
+  if (!isAnnouncer(interaction)) {
+    return interaction.reply({ content: 'You cannot use this command.', ephemeral: true });
+  }
+  const modal = new ModalBuilder().setCustomId('anc_modal').setTitle('Send an announcement');
+  const titleInput = new TextInputBuilder()
+    .setCustomId('anc_title')
+    .setLabel('Title (optional)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(100);
+  const textInput = new TextInputBuilder()
+    .setCustomId('anc_text')
+    .setLabel('Message')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(4000);
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(titleInput),
+    new ActionRowBuilder().addComponents(textInput),
+  );
+  return interaction.showModal(modal);
+}
+
+// Step 2: the form is submitted -> show a preview and ask for confirmation (a mass DM can't be undone)
+async function handleAncModal(interaction) {
+  if (!isAnnouncer(interaction)) {
+    return interaction.reply({ content: 'You cannot use this command.', ephemeral: true });
+  }
+  const title = interaction.fields.getTextInputValue('anc_title').trim();
+  const text = interaction.fields.getTextInputValue('anc_text').trim();
+  if (!text) return interaction.reply({ content: 'The message is empty.', ephemeral: true });
+
+  const recipients = await getAnnouncementRecipients();
+  if (!recipients.length) {
+    return interaction.reply({ content: 'There are no whitelisted users to send this to.', ephemeral: true });
+  }
+
+  const now = Date.now();
+  for (const [id, draft] of pendingAnnouncements) {
+    if (now - draft.createdAt > 15 * 60 * 1000) pendingAnnouncements.delete(id); // forget old drafts
+  }
+  const id = crypto.randomBytes(6).toString('hex');
+  pendingAnnouncements.set(id, { title, text, userId: interaction.user.id, createdAt: now });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`anc_confirm_${id}`).setLabel(`Send to ${recipients.length} users`).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`anc_cancel_${id}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return interaction.reply({
+    content:
+      `Preview: this will be sent by DM to **${recipients.length}** whitelisted users. ` +
+      'People the bot can\'t reach (DMs closed, no shared server) are skipped.',
+    embeds: [buildAnnouncementEmbed(title, text)],
+    components: [row],
+    ephemeral: true,
+  });
+}
+
+// Step 3: confirm / cancel
+async function handleAncButton(interaction) {
+  const [, action, id] = interaction.customId.split('_');
+
+  if (!isAnnouncer(interaction)) {
+    return interaction.reply({ content: 'You cannot use this.', ephemeral: true });
+  }
+  const draft = pendingAnnouncements.get(id);
+  if (!draft || draft.userId !== interaction.user.id) {
+    return interaction.update({ content: 'This draft expired. Run **/anc** again.', embeds: [], components: [] });
+  }
+
+  if (action === 'cancel') {
+    pendingAnnouncements.delete(id);
+    return interaction.update({ content: 'Announcement cancelled.', embeds: [], components: [] });
+  }
+
+  if (announcing) {
+    return interaction.reply({ content: 'An announcement is already being sent, wait for it to finish.', ephemeral: true });
+  }
+  announcing = true;
+  pendingAnnouncements.delete(id); // a draft can only be sent once
+
+  try {
+    await interaction.update({ content: 'Sending… this can take a few minutes.', embeds: [], components: [] });
+
+    const recipients = await getAnnouncementRecipients();
+    const embed = buildAnnouncementEmbed(draft.title, draft.text);
+    let sent = 0;
+    let failed = 0;
+    for (const uid of recipients) {
+      try {
+        const user = await client.users.fetch(uid);
+        await user.send({ embeds: [embed] });
+        sent++;
+      } catch (err) {
+        failed++;
+        if (err.code !== 50007) console.error('Announcement DM failed:', err.message); // 50007 = DMs closed
+      }
+      await sleep(ANC_DELAY_MS);
+    }
+
+    const excerpt = draft.text.replace(/`/g, '').replace(/\s+/g, ' ').slice(0, 200);
+    logEvent(
+      `**[ANNOUNCEMENT]** sent by <@${interaction.user.id}> — delivered ${sent}/${recipients.length}` +
+      `${draft.title ? ` — ${draft.title.replace(/`/g, '')}` : ''}\n> ${excerpt}`
+    );
+
+    const summary =
+      `Announcement sent: delivered to **${sent}** of ${recipients.length} users.` +
+      (failed ? ` ${failed} could not be reached (DMs closed or no shared server).` : '');
+    try {
+      await interaction.editReply({ content: summary });
+    } catch (_) {
+      // the interaction token lasts 15 minutes; on very long sends the result is in the logs channel instead
+    }
+  } catch (err) {
+    console.error('Announcement error:', err);
+    await safeReply(interaction, { content: 'Something went wrong while sending the announcement.', ephemeral: true });
+  } finally {
+    announcing = false;
+  }
+}
+
 // ---------- interactions ----------
 
 client.on('interactionCreate', async (interaction) => {
   // --- Panel buttons (public) ---
   if (interaction.isButton()) {
     try {
+      // announcement confirm / cancel: anc_<action>_<draft id>
+      if (interaction.customId.startsWith('anc_')) {
+        return await handleAncButton(interaction);
+      }
+
       // changelog pagination: cl_<action>_<target index>_<owner id>
       if (interaction.customId.startsWith('cl_')) {
         const [, , index, ownerId] = interaction.customId.split('_');
@@ -739,9 +902,29 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
+  // --- Announcement form submission ---
+  if (interaction.isModalSubmit() && interaction.customId === 'anc_modal') {
+    try {
+      return await handleAncModal(interaction);
+    } catch (err) {
+      console.error('Announcement form error:', err);
+      return safeReply(interaction, { content: 'Something went wrong.', ephemeral: true });
+    }
+  }
+
   // --- User commands (anyone with the app installed) ---
   if (interaction.isChatInputCommand() && USER_COMMAND_NAMES.has(interaction.commandName)) {
     return handleUserCommand(interaction);
+  }
+
+  // --- /anc: only the ALLOWED_ROLE_ID role, any channel of the server ---
+  if (interaction.isChatInputCommand() && interaction.commandName === 'anc') {
+    try {
+      return await handleAncCommand(interaction);
+    } catch (err) {
+      console.error('Announcement command error:', err);
+      return safeReply(interaction, { content: 'Something went wrong.', ephemeral: true });
+    }
   }
 
   // --- Admin slash commands (role + channel restricted) ---
