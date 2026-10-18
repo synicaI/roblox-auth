@@ -256,7 +256,7 @@ function buildInfoEmbed() {
       'Ibuprofen works with most executors, but some may crash on the first execution.'
     )
     .addFields(
-      { name: 'Pricing', value: '• 7-Day License — €1\n• 30-Day License — €2\n• Lifetime License — €3' },
+      { name: 'Pricing', value: '• 7-Day License — €4\n• 1-Month License — €6\n• Lifetime License — €10' },
       { name: 'More questions?', value: 'Make a ticket in our Discord server. Use **/help** to get the invite.' },
     );
 }
