@@ -24,6 +24,8 @@ const RENEW_URL = process.env.RENEW_URL || '';             // optional link show
 const REMINDER_DAYS = 3;
 const SERVER_INVITE = process.env.SERVER_INVITE || 'https://discord.gg/uTEs99V6qE';
 const NEED_KEY_MSG = 'You need an active key to use this. Use **/redeem** to link one.';
+const MEDIA_CHANNEL_ID = process.env.MEDIA_CHANNEL_ID || '1543305747092349061'; // where /media clips are posted
+const MEDIA_MAX_MB = parseInt(process.env.MEDIA_MAX_MB, 10) || 25;
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;            // hourly
 
 const unix = (d) => Math.floor(new Date(d).getTime() / 1000);
@@ -76,6 +78,11 @@ const userCommandBuilders = [
   new SlashCommandBuilder()
     .setName('hwid-reset')
     .setDescription('Reset your HWID (cooldown applies)'),
+  new SlashCommandBuilder()
+    .setName('media')
+    .setDescription('Post a clip in the clips channel')
+    .addAttachmentOption(o => o.setName('file').setDescription('Your clip (.mp4 or .mov)').setRequired(true))
+    .addBooleanOption(o => o.setName('anonymous').setDescription('Post anonymously?').setRequired(true)),
   new SlashCommandBuilder()
     .setName('help')
     .setDescription('Get the support server invite'),
@@ -240,6 +247,81 @@ function buildInfoEmbed() {
     );
 }
 
+// /media: re-uploads the clip in the clips channel, anonymous or credited
+async function handleMedia(interaction, userId) {
+  const attachment = interaction.options.getAttachment('file');
+  const anonymous = interaction.options.getBoolean('anonymous');
+
+  // always private: a public reply would show who used the command (and the file) even for "anonymous" posts
+  await interaction.deferReply({ ephemeral: true });
+
+  const nameOk = /\.(mp4|mov)$/i.test(attachment.name || '');
+  const typeOk = !attachment.contentType || attachment.contentType.startsWith('video/');
+  if (!nameOk || !typeOk) {
+    return interaction.editReply('Only **.mp4** and **.mov** files are allowed.');
+  }
+  if (attachment.size > MEDIA_MAX_MB * 1024 * 1024) {
+    return interaction.editReply(`That file is too big (max ${MEDIA_MAX_MB} MB).`);
+  }
+
+  // download it from Discord's CDN so the clip stays available after the link expires
+  let buffer;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60_000);
+  try {
+    const res = await fetch(attachment.url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    buffer = Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    console.error('Media download failed:', err.message);
+    return interaction.editReply('Could not read your file, please try again.');
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let channel;
+  try {
+    channel = await client.channels.fetch(MEDIA_CHANNEL_ID);
+    if (!channel || !channel.isTextBased()) throw new Error('not a text channel');
+  } catch (err) {
+    console.error('Media channel unavailable:', err.message);
+    return interaction.editReply('The clips channel is not available right now. Contact an admin.');
+  }
+
+  // credit only if they asked for it AND they're in the server (otherwise there's nobody to ping)
+  let content;
+  if (!anonymous) {
+    try {
+      await channel.guild.members.fetch(userId);
+      content = `Clip by <@${userId}>`;
+    } catch (_) {
+      // not in the server: post the clip without a credit
+    }
+  }
+
+  // generic file name so it can't reveal who the uploader is
+  const ext = attachment.name.split('.').pop().toLowerCase();
+  try {
+    const sent = await channel.send({
+      content,
+      files: [new AttachmentBuilder(buffer, { name: `clip.${ext}` })],
+      allowedMentions: { users: content ? [userId] : [] },
+    });
+    logEvent(`**[MEDIA]** clip posted by <@${userId}> (${anonymous ? 'anonymous' : 'credited'}) — ${sent.url}`);
+    return interaction.editReply(
+      anonymous
+        ? `Your clip was posted anonymously: ${sent.url}\nStaff can still see who posted it, for moderation.`
+        : `Your clip was posted: ${sent.url}`
+    );
+  } catch (err) {
+    console.error('Media post failed:', err.message);
+    if (err.code === 40005) {
+      return interaction.editReply('That file is over the server\'s upload limit, try a smaller clip.');
+    }
+    return interaction.editReply('Could not post your clip. Contact an admin.');
+  }
+}
+
 async function handleUserCommand(interaction) {
   const userId = interaction.user.id;
   const name = interaction.commandName;
@@ -284,6 +366,8 @@ async function handleUserCommand(interaction) {
     // Everything below needs an active key linked to this account (revoked/expired => blocked until a new redeem)
     const key = await getActiveKey(userId);
     if (!key) return interaction.reply({ content: NEED_KEY_MSG, ephemeral: true });
+
+    if (name === 'media') return handleMedia(interaction, userId);
 
     if (name === 'script') {
       // always private: a public reply would let everyone in the channel download the script
