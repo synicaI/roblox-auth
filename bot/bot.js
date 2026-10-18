@@ -1,6 +1,6 @@
 // bot/bot.js — key management, license panel, hourly maintenance, event logs
 const {
-  Client, GatewayIntentBits, REST, Routes,
+  Client, GatewayIntentBits, Partials, REST, Routes,
   SlashCommandBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle,
@@ -26,6 +26,7 @@ const SERVER_INVITE = process.env.SERVER_INVITE || 'https://discord.gg/uTEs99V6q
 const NEED_KEY_MSG = 'You need an active key to use this. Use **/redeem** to link one.';
 const MEDIA_CHANNEL_ID = process.env.MEDIA_CHANNEL_ID || '1543305747092349061'; // where /media clips are posted
 const MEDIA_MAX_MB = parseInt(process.env.MEDIA_MAX_MB, 10) || 25;
+const CHANGELOG_CHANNEL_ID = process.env.CHANGELOG_CHANNEL_ID || '1543322523414827023'; // channel the changelog is read from
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;            // hourly
 
 const unix = (d) => Math.floor(new Date(d).getTime() / 1000);
@@ -84,6 +85,9 @@ const userCommandBuilders = [
     .addAttachmentOption(o => o.setName('file').setDescription('Your clip (.mp4 or .mov)').setRequired(true))
     .addBooleanOption(o => o.setName('anonymous').setDescription('Post anonymously?').setRequired(true)),
   new SlashCommandBuilder()
+    .setName('changelog')
+    .setDescription('Browse the latest updates and changes'),
+  new SlashCommandBuilder()
     .setName('help')
     .setDescription('Get the support server invite'),
 ];
@@ -112,7 +116,14 @@ function isAllowed(interaction) {
   return interaction.member.roles.cache.has(ALLOWED_ROLE_ID);
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent, // privileged: must be enabled in the developer portal (Bot tab)
+  ],
+  partials: [Partials.Message], // so edits/deletes of older, uncached messages are still received
+});
 
 async function safeReply(interaction, payload) {
   try {
@@ -359,6 +370,10 @@ async function handleUserCommand(interaction) {
       return interaction.reply({ embeds: [buildInfoEmbed()], ...(await visibility(userId)) });
     }
 
+    if (name === 'changelog') {
+      return interaction.reply({ ...(await changelogPage(userId, 0)), ...(await visibility(userId)) });
+    }
+
     if (name === 'help') {
       return interaction.reply({ content: `Need help? Join the server and make a ticket: ${SERVER_INVITE}`, ...(await visibility(userId)) });
     }
@@ -448,12 +463,185 @@ async function runMaintenance() {
   }
 }
 
+// ---------- changelog: every message of the changelog channel becomes a catalog entry ----------
+
+// Text of a message; falls back to embed text because webhook-style changelogs often have an empty content
+function changelogText(msg) {
+  let text = msg.content || '';
+  if (!text.trim() && msg.embeds && msg.embeds.length) {
+    text = msg.embeds
+      .map((e) =>
+        [e.title, e.description, ...(e.fields || []).map((f) => `**${f.name}**\n${f.value}`)]
+          .filter(Boolean)
+          .join('\n')
+      )
+      .join('\n\n');
+  }
+  return text.trim();
+}
+
+function changelogRow(msg) {
+  if (msg.system) return null; // joins, pins, boosts...
+  const text = changelogText(msg);
+  const attachments = msg.attachments ? msg.attachments.size : 0;
+  if (!text && !attachments) return null;
+  return { id: msg.id, guildId: msg.guildId || '', text, attachments, createdMs: msg.createdTimestamp };
+}
+
+// Insert or update (edited messages overwrite their entry)
+async function saveChangelogMessages(messages) {
+  const rows = messages.map(changelogRow).filter(Boolean);
+  if (!rows.length) return 0;
+  await pool.query(
+    `INSERT INTO changelog (message_id, guild_id, content, attachment_count, created_ms)
+     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::int[], $5::bigint[])
+     ON CONFLICT (message_id) DO UPDATE
+       SET content = EXCLUDED.content, attachment_count = EXCLUDED.attachment_count`,
+    [rows.map((r) => r.id), rows.map((r) => r.guildId), rows.map((r) => r.text), rows.map((r) => r.attachments), rows.map((r) => r.createdMs)]
+  );
+  return rows.length;
+}
+
+// Reads the whole history of the channel (newest to oldest) and stores it. Runs once at startup.
+async function syncChangelog() {
+  const startedMs = Date.now();
+  try {
+    const channel = await client.channels.fetch(CHANGELOG_CHANNEL_ID);
+    if (!channel || !channel.isTextBased()) throw new Error('not a text channel');
+
+    const seen = [];
+    let before;
+    for (;;) {
+      const batch = await channel.messages.fetch({ limit: 100, ...(before && { before }) });
+      if (!batch.size) break;
+      const list = [...batch.values()];
+      await saveChangelogMessages(list);
+      for (const m of list) seen.push(m.id);
+      before = list.reduce((min, m) => (BigInt(m.id) < BigInt(min) ? m.id : min), list[0].id);
+      if (batch.size < 100) break;
+    }
+
+    // drop entries whose message was deleted while the bot was offline
+    // (only older than the sync start, so a message posted during the sync is never removed)
+    if (seen.length) {
+      await pool.query(
+        'DELETE FROM changelog WHERE created_ms < $2 AND NOT (message_id = ANY($1::text[]))',
+        [seen, startedMs]
+      );
+    }
+    console.log(`Changelog synced: ${seen.length} messages read.`);
+  } catch (err) {
+    console.error('Changelog sync failed (can the bot read that channel, and is Message Content Intent on?):', err.message);
+  }
+}
+
+// New messages, edits and deletions keep the catalog up to date
+client.on('messageCreate', async (msg) => {
+  if (msg.channelId !== CHANGELOG_CHANNEL_ID) return;
+  try {
+    await saveChangelogMessages([msg]);
+  } catch (err) {
+    console.error('Changelog save failed:', err.message);
+  }
+});
+
+client.on('messageUpdate', async (_old, msg) => {
+  if (msg.channelId !== CHANGELOG_CHANNEL_ID) return;
+  try {
+    if (msg.partial) msg = await msg.fetch();
+    await saveChangelogMessages([msg]);
+  } catch (err) {
+    console.error('Changelog update failed:', err.message);
+  }
+});
+
+client.on('messageDelete', async (msg) => {
+  if (msg.channelId !== CHANGELOG_CHANNEL_ID) return;
+  try {
+    await pool.query('DELETE FROM changelog WHERE message_id = $1', [msg.id]);
+  } catch (err) {
+    console.error('Changelog delete failed:', err.message);
+  }
+});
+
+client.on('messageDeleteBulk', async (messages, channel) => {
+  if (channel.id !== CHANGELOG_CHANNEL_ID) return;
+  try {
+    await pool.query('DELETE FROM changelog WHERE message_id = ANY($1::text[])', [[...messages.keys()]]);
+  } catch (err) {
+    console.error('Changelog bulk delete failed:', err.message);
+  }
+});
+
+// One entry per page, newest first, with navigation buttons
+async function changelogPage(userId, index) {
+  const { rows: counted } = await pool.query('SELECT COUNT(*)::int AS n FROM changelog');
+  const total = counted[0].n;
+  if (!total) {
+    return {
+      embeds: [new EmbedBuilder().setTitle('Changelog').setDescription('No changelog entries yet.').setColor(0x5865F2)],
+      components: [],
+    };
+  }
+
+  const i = Math.min(Math.max(Number.isFinite(index) ? index : 0, 0), total - 1);
+  const { rows } = await pool.query(
+    `SELECT message_id, guild_id, content, attachment_count, created_ms
+     FROM changelog ORDER BY created_ms DESC, message_id DESC LIMIT 1 OFFSET $1`,
+    [i]
+  );
+  const r = rows[0];
+
+  const link = r.guild_id
+    ? `\n\n[View original](https://discord.com/channels/${r.guild_id}/${CHANGELOG_CHANNEL_ID}/${r.message_id})`
+    : '';
+  const extra = r.attachment_count
+    ? `\n\n📎 ${r.attachment_count} attachment${r.attachment_count > 1 ? 's' : ''}`
+    : '';
+  const max = 4000 - link.length - extra.length;
+  let body = r.content || '*(no text)*';
+  if (body.length > max) body = body.slice(0, max - 1) + '…';
+
+  const embed = new EmbedBuilder()
+    .setTitle('Changelog')
+    .setDescription(body + extra + link)
+    .setColor(0x5865F2)
+    .setFooter({ text: `Entry ${i + 1} of ${total} · newest first` })
+    .setTimestamp(Number(r.created_ms));
+
+  const btn = (action, target, label, disabled) =>
+    new ButtonBuilder()
+      .setCustomId(`cl_${action}_${target}_${userId}`) // the action keeps every id unique
+      .setLabel(label)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(disabled);
+
+  const atStart = i === 0;
+  const atEnd = i === total - 1;
+  const row = new ActionRowBuilder().addComponents(
+    btn('first', 0, '⏮', atStart),
+    btn('prev', i - 1, '◀', atStart),
+    btn('next', i + 1, '▶', atEnd),
+    btn('last', total - 1, '⏭', atEnd),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
 // ---------- interactions ----------
 
 client.on('interactionCreate', async (interaction) => {
   // --- Panel buttons (public) ---
   if (interaction.isButton()) {
     try {
+      // changelog pagination: cl_<action>_<target index>_<owner id>
+      if (interaction.customId.startsWith('cl_')) {
+        const [, , index, ownerId] = interaction.customId.split('_');
+        if (ownerId !== interaction.user.id) {
+          return interaction.reply({ content: 'Run **/changelog** yourself to browse the changelog.', ephemeral: true });
+        }
+        return interaction.update(await changelogPage(interaction.user.id, parseInt(index, 10)));
+      }
+
       if (interaction.customId === 'get_role') {
         const modal = new ModalBuilder().setCustomId('key_modal').setTitle('Enter your license key');
         const keyInput = new TextInputBuilder()
@@ -698,4 +886,7 @@ client.on('interactionCreate', async (interaction) => {
 
   // status embed in the status channel every 15 minutes
   startStatusMonitor(client);
+
+  // read the changelog channel history into the catalog
+  setTimeout(syncChangelog, 15_000);
 })();
