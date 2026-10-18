@@ -53,6 +53,18 @@ async function initSchema() {
           v TEXT
         );
       `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS changelog (
+          message_id TEXT PRIMARY KEY,
+          guild_id TEXT,
+          content TEXT NOT NULL DEFAULT '',
+          attachment_count INTEGER NOT NULL DEFAULT 0,
+          created_ms BIGINT NOT NULL
+        );
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS changelog_created_idx ON changelog (created_ms DESC);
+      `);
       return;
     } catch (err) {
       if (attempt === 3) throw err;
