@@ -395,7 +395,7 @@ function createAdmin({ pool, logEvent, addLicenseRole, removeLicenseRole, hasAct
       return interaction.reply({
         content:
           state === 'on'
-            ? 'Maintenance mode is **ON**: /verify answers "maintenance" (it can take up to 10 seconds to apply) and the status embed shows Maintenance. The loader shows a message instead of kicking.'
+            ? 'Maintenance mode is **ON**: /verify refuses every key with "maintenance" (it can take up to 10 seconds to apply), so scripts fail to authenticate (kicked when Debug is false), and the status embed shows Maintenance.'
             : 'Maintenance mode is **OFF**: /verify is back to normal.',
         ephemeral: true,
       });
