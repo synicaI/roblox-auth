@@ -27,7 +27,9 @@ async function initSchema() {
         ALTER TABLE keys
           ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN NOT NULL DEFAULT FALSE,
           ADD COLUMN IF NOT EXISTS role_removed BOOLEAN NOT NULL DEFAULT FALSE,
-          ADD COLUMN IF NOT EXISTS last_hwid_reset TIMESTAMP;
+          ADD COLUMN IF NOT EXISTS last_hwid_reset TIMESTAMP,
+          ADD COLUMN IF NOT EXISTS frozen BOOLEAN NOT NULL DEFAULT FALSE,
+          ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP;
       `);
       await pool.query(`
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -65,6 +67,39 @@ async function initSchema() {
       await pool.query(`
         CREATE INDEX IF NOT EXISTS changelog_created_idx ON changelog (created_ms DESC);
       `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS verify_log (
+          id SERIAL PRIMARY KEY,
+          key_value TEXT,
+          hwid TEXT,
+          roblox_name TEXT,
+          result TEXT NOT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS verify_log_key_idx ON verify_log (key_value, created_at DESC);`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS verify_log_created_idx ON verify_log (created_at);`);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS blacklist (
+          id SERIAL PRIMARY KEY,
+          type TEXT NOT NULL,
+          value TEXT NOT NULL,
+          reason TEXT,
+          added_by TEXT,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          UNIQUE (type, value)
+        );
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS media_posts (
+          id SERIAL PRIMARY KEY,
+          message_id TEXT UNIQUE,
+          uploader_id TEXT NOT NULL,
+          anonymous BOOLEAN NOT NULL DEFAULT FALSE,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS media_posts_uploader_idx ON media_posts (uploader_id, created_at DESC);`);
       return;
     } catch (err) {
       if (attempt === 3) throw err;
