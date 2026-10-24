@@ -58,6 +58,7 @@ function buildServices(client) {
           body: JSON.stringify({ key: PROBE_KEY, hwid: 'status-probe' }),
         });
         const body = await res.json();
+        if (res.status === 503 && body.reason === 'maintenance') return; // API is answering, it's just in maintenance
         if (res.status !== 404 || body.reason !== 'invalid_key') {
           throw new Error(`unexpected response (${res.status})`);
         }
@@ -74,8 +75,13 @@ function buildServices(client) {
       // gateway connection state + websocket ping
       name: 'Discord Bot',
       check: async () => {
-        if (!client.isReady() || !(client.ws.ping >= 0)) throw new Error('gateway not ready');
-        return client.ws.ping;
+        if (!client.isReady()) throw new Error(`gateway not ready (ws status ${client.ws.status})`);
+        if (client.ws.ping >= 0) return client.ws.ping;
+        // right after a restart the first heartbeat hasn't been acknowledged yet (ping is -1):
+        // measure a REST round trip to Discord instead of reporting the bot as down
+        const start = Date.now();
+        await client.rest.get('/gateway');
+        return Date.now() - start;
       },
     },
   ];
@@ -179,6 +185,21 @@ async function deleteMessage(channel, id) {
   }
 }
 
+// Maintenance mode is switched with /maintenance and stored in bot_state
+async function getMaintenance() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT k, v FROM bot_state WHERE k IN ('maintenance', 'maintenance_message')`
+    );
+    const map = Object.fromEntries(rows.map((r) => [r.k, r.v]));
+    return { on: map.maintenance === 'on', message: map.maintenance_message || '' };
+  } catch (_) {
+    return { on: false, message: '' };
+  }
+}
+
+const SERVICE_ORDER = ['API', 'Database', 'Authentication', 'Licensing', 'Discord Bot'];
+
 // ---------- formatting ----------
 
 function formatDuration(ms) {
@@ -195,11 +216,14 @@ function formatDuration(ms) {
 
 const fmtPct = (p) => `${Number(p.toFixed(1))}%`;
 
-function buildEmbed(results, uptime) {
+function buildEmbed(results, uptime, maint = { on: false, message: '' }) {
   const down = results.filter((r) => !r.ok);
   let label = 'Operational';
   let color = 0x2ecc71;
-  if (down.length === results.length) {
+  if (maint.on) {
+    label = 'Maintenance';
+    color = 0x3498db;
+  } else if (down.length === results.length) {
     label = 'Major outage';
     color = 0xe74c3c;
   } else if (down.length) {
@@ -212,9 +236,13 @@ function buildEmbed(results, uptime) {
     return `${r.ok ? '🟢' : '🔴'} **${r.name}** · ${up} · ${r.ok ? `${r.latency}ms` : 'Down'}`;
   });
 
+  const header = maint.on
+    ? `🔧 **Scheduled maintenance in progress**${maint.message ? `\n${maint.message}` : ''}\n\n`
+    : '';
+
   return new EmbedBuilder()
     .setTitle(`Ibuprofen Status — ${label}`)
-    .setDescription(lines.join('\n'))
+    .setDescription(header + lines.join('\n'))
     .setColor(color)
     .setFooter({ text: 'Updates every 15 min' })
     .setTimestamp();
@@ -236,7 +264,8 @@ async function runCycle(client) {
     if (pendingChecks.length > 500) pendingChecks.splice(0, pendingChecks.length - 500);
 
     const uptime = await recordAndGetUptime();
-    const embed = buildEmbed(results, uptime);
+    const maint = await getMaintenance();
+    const embed = buildEmbed(results, uptime, maint);
 
     // work out the problem / resolved message without committing anything until it's actually posted
     const down = results.filter((r) => !r.ok).map((r) => r.name);
@@ -245,7 +274,9 @@ async function runCycle(client) {
       : null;
     let notice = null;
 
-    if (down.length) {
+    if (maint.on) {
+      // scheduled maintenance: no problem / resolved messages, the incident state stays as it was
+    } else if (down.length) {
       if (!nextIncident) nextIncident = { started: Date.now(), services: [] };
       for (const name of down) if (!nextIncident.services.includes(name)) nextIncident.services.push(name);
       notice =
@@ -300,4 +331,78 @@ function startStatusMonitor(client) {
   setInterval(() => runCycle(client), INTERVAL_MS);
 }
 
-module.exports = { startStatusMonitor };
+// Used by /status: current state of every system with 24h and 7d uptime from the stored history
+async function getStatusSummary() {
+  const maint = await getMaintenance();
+  let latest = [];
+  let windows = [];
+  try {
+    latest = (await pool.query(
+      `SELECT DISTINCT ON (service) service, ok, latency_ms, checked_at
+       FROM status_checks ORDER BY service, checked_at DESC`
+    )).rows;
+    windows = (await pool.query(
+      `SELECT service,
+              (COUNT(*) FILTER (WHERE checked_at > NOW() - INTERVAL '24 hours'))::int AS t24,
+              (COUNT(*) FILTER (WHERE ok AND checked_at > NOW() - INTERVAL '24 hours'))::int AS u24,
+              (COUNT(*) FILTER (WHERE checked_at > NOW() - INTERVAL '7 days'))::int AS t7,
+              (COUNT(*) FILTER (WHERE ok AND checked_at > NOW() - INTERVAL '7 days'))::int AS u7
+       FROM status_checks GROUP BY service`
+    )).rows;
+  } catch (err) {
+    console.error('Status summary query failed:', err.message);
+  }
+
+  if (!latest.length) {
+    return new EmbedBuilder()
+      .setTitle('Ibuprofen Status')
+      .setColor(0x5865F2)
+      .setDescription('No data yet, the first check runs shortly after the bot starts.');
+  }
+
+  const byLatest = Object.fromEntries(latest.map((r) => [r.service, r]));
+  const byWindow = Object.fromEntries(windows.map((r) => [r.service, r]));
+  const pct = (up, total) => (total ? fmtPct((up / total) * 100) : 'n/a');
+
+  const lines = [];
+  let downCount = 0;
+  for (const name of SERVICE_ORDER) {
+    const l = byLatest[name];
+    if (!l) continue;
+    const w = byWindow[name] || { t24: 0, u24: 0, t7: 0, u7: 0 };
+    if (!l.ok) downCount++;
+    lines.push(
+      `${l.ok ? '🟢' : '🔴'} **${name}** · 24h ${pct(w.u24, w.t24)} · 7d ${pct(w.u7, w.t7)} · ${l.ok ? `${l.latency_ms}ms` : 'Down'}`
+    );
+  }
+
+  let label = 'Operational';
+  let color = 0x2ecc71;
+  if (maint.on) {
+    label = 'Maintenance';
+    color = 0x3498db;
+  } else if (downCount === lines.length) {
+    label = 'Major outage';
+    color = 0xe74c3c;
+  } else if (downCount) {
+    label = 'Partial outage';
+    color = 0xf39c12;
+  }
+
+  const header = maint.on
+    ? `🔧 **Scheduled maintenance in progress**${maint.message ? `\n${maint.message}` : ''}\n\n`
+    : '';
+  const newest = latest.reduce((m, r) => Math.max(m, new Date(r.checked_at).getTime()), 0);
+
+  return new EmbedBuilder()
+    .setTitle(`Ibuprofen Status — ${label}`)
+    .setDescription(header + lines.join('\n'))
+    .setColor(color)
+    .setFooter({ text: 'Last check' })
+    .setTimestamp(new Date(newest));
+}
+
+// run a check cycle right now (used after /maintenance so the embed updates immediately)
+const refreshStatus = (client) => runCycle(client);
+
+module.exports = { startStatusMonitor, refreshStatus, getStatusSummary };
