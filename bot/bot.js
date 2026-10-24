@@ -10,7 +10,8 @@ const crypto = require('crypto');
 const path = require('path');
 const { pool, initSchema } = require('../db');
 const { logEvent } = require('../log');
-const { startStatusMonitor } = require('./status');
+const { startStatusMonitor, refreshStatus, getStatusSummary } = require('./status');
+const { createAdmin } = require('./admin');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -26,6 +27,7 @@ const SERVER_INVITE = process.env.SERVER_INVITE || 'https://discord.gg/uTEs99V6q
 const NEED_KEY_MSG = 'You need an active key to use this. Use **/redeem** to link one.';
 const MEDIA_CHANNEL_ID = process.env.MEDIA_CHANNEL_ID || '1543305747092349061'; // where /media clips are posted
 const MEDIA_MAX_MB = parseInt(process.env.MEDIA_MAX_MB, 10) || 25;
+const MEDIA_COOLDOWN_MINUTES = parseInt(process.env.MEDIA_COOLDOWN_MINUTES, 10) || 10; // per user, between two /media clips
 const CHANGELOG_CHANNEL_ID = process.env.CHANGELOG_CHANNEL_ID || '1543322523414827023'; // channel the changelog is read from
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;            // hourly
 
@@ -88,6 +90,9 @@ const userCommandBuilders = [
     .addAttachmentOption(o => o.setName('file').setDescription('Your clip (.mp4 or .mov)').setRequired(true))
     .addBooleanOption(o => o.setName('anonymous').setDescription('Post anonymously?').setRequired(true)),
   new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Show the current status of every system (24h and 7d uptime)'),
+  new SlashCommandBuilder()
     .setName('changelog')
     .setDescription('Browse the latest updates and changes'),
   new SlashCommandBuilder()
@@ -104,7 +109,9 @@ const USER_COMMAND_NAMES = new Set(userCommandBuilders.map(c => c.name));
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   // admin commands stay private to your server
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: adminCommands });
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
+    body: [...adminCommands, ...adminExtras.builders.map((b) => b.toJSON())],
+  });
   // user commands are global so they work everywhere
   await rest.put(Routes.applicationCommands(CLIENT_ID), { body: userCommands });
   console.log('Slash commands registered.');
@@ -126,6 +133,16 @@ const client = new Client({
     GatewayIntentBits.MessageContent, // privileged: must be enabled in the developer portal (Bot tab)
   ],
   partials: [Partials.Message], // so edits/deletes of older, uncached messages are still received
+});
+
+// /checkkey /lookup /extend /unlink /freeze /history /blacklist /mediaban /maintenance /serverstats ...
+const adminExtras = createAdmin({
+  pool,
+  logEvent,
+  addLicenseRole,
+  removeLicenseRole,
+  hasActiveKey,
+  refreshStatus: () => refreshStatus(client),
 });
 
 async function safeReply(interaction, payload) {
@@ -166,8 +183,17 @@ async function removeLicenseRole(userId) {
 
 async function hasActiveKey(discordId) {
   const { rows } = await pool.query(
-    'SELECT 1 FROM keys WHERE discord_id = $1 AND expires_at > NOW() LIMIT 1',
+    'SELECT 1 FROM keys WHERE discord_id = $1 AND expires_at > NOW() AND frozen = FALSE LIMIT 1',
     [discordId]
+  );
+  return rows.length > 0;
+}
+
+// type: 'discord' (full ban) or 'media' (banned from /media); 'hwid' bans are checked by the API
+async function isBlacklisted(type, value) {
+  const { rows } = await pool.query(
+    'SELECT 1 FROM blacklist WHERE type = $1 AND value = $2 LIMIT 1',
+    [type, value]
   );
   return rows.length > 0;
 }
@@ -176,10 +202,15 @@ async function hasActiveKey(discordId) {
 
 // Validates a key and links it to a Discord account (atomic, so two people can't claim it at once)
 async function claimKey(userId, key) {
+  if (await isBlacklisted('discord', userId)) {
+    return { ok: false, message: 'Your account is blacklisted.' };
+  }
+
   const { rows } = await pool.query('SELECT * FROM keys WHERE key_value = $1', [key]);
   const row = rows[0];
 
   if (!row) return { ok: false, message: 'Invalid key.' };
+  if (row.frozen) return { ok: false, message: 'This key is suspended. Contact an admin.' };
   if (new Date(row.expires_at) < new Date()) return { ok: false, message: 'This key has expired.' };
   if (row.discord_id && row.discord_id !== userId) {
     return { ok: false, message: 'This key is already linked to another Discord account.' };
@@ -188,7 +219,7 @@ async function claimKey(userId, key) {
   const firstClaim = !row.discord_id;
   if (firstClaim) {
     const result = await pool.query(
-      'UPDATE keys SET discord_id = $1 WHERE id = $2 AND discord_id IS NULL',
+      'UPDATE keys SET discord_id = $1, claimed_at = NOW() WHERE id = $2 AND discord_id IS NULL',
       [userId, row.id]
     );
     if (!result.rowCount) {
@@ -205,7 +236,7 @@ async function getActiveKey(userId) {
             (last_hwid_reset IS NULL OR last_hwid_reset + ($2 || ' days')::interval <= NOW()) AS can_reset,
             last_hwid_reset + ($2 || ' days')::interval AS available_at
      FROM keys
-     WHERE discord_id = $1 AND expires_at > NOW()
+     WHERE discord_id = $1 AND expires_at > NOW() AND frozen = FALSE
      ORDER BY expires_at DESC LIMIT 1`,
     [userId, String(RESET_COOLDOWN_DAYS)]
   );
@@ -262,12 +293,48 @@ function buildInfoEmbed() {
 }
 
 // /media: re-uploads the clip in the clips channel, anonymous or credited
-async function handleMedia(interaction, userId) {
-  const attachment = interaction.options.getAttachment('file');
-  const anonymous = interaction.options.getBoolean('anonymous');
+const mediaInFlight = new Set();
 
+const mediaDeleteRow = () =>
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('media_delete').setEmoji('🗑️').setLabel('Delete').setStyle(ButtonStyle.Secondary)
+  );
+
+async function handleMedia(interaction, userId) {
   // always private: a public reply would show who used the command (and the file) even for "anonymous" posts
   await interaction.deferReply({ ephemeral: true });
+
+  // check + add happen in the same tick, so two simultaneous commands can't both get through
+  if (mediaInFlight.has(userId)) {
+    return interaction.editReply('Your previous clip is still being posted, please wait.');
+  }
+  mediaInFlight.add(userId);
+
+  try {
+    if (await isBlacklisted('media', userId)) {
+      return interaction.editReply('You are banned from using /media.');
+    }
+
+    // one clip per user every MEDIA_COOLDOWN_MINUTES
+    const { rows } = await pool.query(
+      `SELECT created_at + ($2 || ' minutes')::interval AS available_at,
+              created_at + ($2 || ' minutes')::interval > NOW() AS blocked
+       FROM media_posts WHERE uploader_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [userId, String(MEDIA_COOLDOWN_MINUTES)]
+    );
+    if (rows[0] && rows[0].blocked) {
+      return interaction.editReply(`You can post another clip <t:${unix(rows[0].available_at)}:R>.`);
+    }
+
+    return await postMedia(interaction, userId);
+  } finally {
+    mediaInFlight.delete(userId);
+  }
+}
+
+async function postMedia(interaction, userId) {
+  const attachment = interaction.options.getAttachment('file');
+  const anonymous = interaction.options.getBoolean('anonymous');
 
   const nameOk = /\.(mp4|mov)$/i.test(attachment.name || '');
   const typeOk = !attachment.contentType || attachment.contentType.startsWith('video/');
@@ -320,7 +387,16 @@ async function handleMedia(interaction, userId) {
       content,
       files: [new AttachmentBuilder(buffer, { name: `clip.${ext}` })],
       allowedMentions: { users: content ? [userId] : [] },
+      components: [mediaDeleteRow()], // staff-only delete button
     });
+    try {
+      await pool.query(
+        'INSERT INTO media_posts (message_id, uploader_id, anonymous) VALUES ($1, $2, $3)',
+        [sent.id, userId, !!anonymous]
+      );
+    } catch (err) {
+      console.error('Could not record media post:', err.message);
+    }
     logEvent(`**[MEDIA]** clip posted by <@${userId}> (${anonymous ? 'anonymous' : 'credited'}) — ${sent.url}`);
     return interaction.editReply(
       anonymous
@@ -377,11 +453,18 @@ async function handleUserCommand(interaction) {
       return interaction.reply({ ...(await changelogPage(userId, 0)), ...(await visibility(userId)) });
     }
 
+    if (name === 'status') {
+      return interaction.reply({ embeds: [await getStatusSummary()], ...(await visibility(userId)) });
+    }
+
     if (name === 'help') {
       return interaction.reply({ content: `Need help? Join the server and make a ticket: ${SERVER_INVITE}`, ...(await visibility(userId)) });
     }
 
     // Everything below needs an active key linked to this account (revoked/expired => blocked until a new redeem)
+    if (await isBlacklisted('discord', userId)) {
+      return interaction.reply({ content: 'Your account is blacklisted.', ephemeral: true });
+    }
     const key = await getActiveKey(userId);
     if (!key) return interaction.reply({ content: NEED_KEY_MSG, ephemeral: true });
 
@@ -426,16 +509,19 @@ async function handleUserCommand(interaction) {
 
 async function runMaintenance() {
   try {
-    // 1. Remove the license role from owners whose key(s) have all expired
+    // old execution history (kept 30 days)
+    await pool.query(`DELETE FROM verify_log WHERE created_at < NOW() - INTERVAL '30 days'`);
+
+    // 1. Remove the license role from owners whose key(s) have all expired or been frozen
     const { rows: expired } = await pool.query(
-      `SELECT id, key_value, discord_id FROM keys
-       WHERE discord_id IS NOT NULL AND role_removed = FALSE AND expires_at < NOW()`
+      `SELECT id, key_value, discord_id, frozen FROM keys
+       WHERE discord_id IS NOT NULL AND role_removed = FALSE AND (expires_at < NOW() OR frozen = TRUE)`
     );
     for (const row of expired) {
       if (!(await hasActiveKey(row.discord_id))) {
         const ok = await removeLicenseRole(row.discord_id);
         if (!ok) continue; // retry next run
-        logEvent(`**[ROLE REMOVED]** <@${row.discord_id}> — key \`${row.key_value}\` expired`);
+        logEvent(`**[ROLE REMOVED]** <@${row.discord_id}> — key \`${row.key_value}\` ${row.frozen ? 'frozen' : 'expired'}`);
       }
       await pool.query('UPDATE keys SET role_removed = TRUE WHERE id = $1', [row.id]);
     }
@@ -647,7 +733,7 @@ function isAnnouncer(interaction) {
 // "Whitelisted" = a Discord account linked to a key that hasn't expired (one DM per person)
 async function getAnnouncementRecipients() {
   const { rows } = await pool.query(
-    'SELECT DISTINCT discord_id FROM keys WHERE discord_id IS NOT NULL AND expires_at > NOW()'
+    'SELECT DISTINCT discord_id FROM keys WHERE discord_id IS NOT NULL AND expires_at > NOW() AND frozen = FALSE'
   );
   return rows.map((r) => r.discord_id);
 }
@@ -791,6 +877,21 @@ client.on('interactionCreate', async (interaction) => {
   // --- Panel buttons (public) ---
   if (interaction.isButton()) {
     try {
+      // staff-only delete button under each clip
+      if (interaction.customId === 'media_delete') {
+        if (!isAnnouncer(interaction)) {
+          return interaction.reply({ content: 'Only staff can delete clips.', ephemeral: true });
+        }
+        const { rows } = await pool.query('SELECT uploader_id FROM media_posts WHERE message_id = $1', [interaction.message.id]);
+        await interaction.message.delete();
+        const uploader = rows[0] && rows[0].uploader_id;
+        logEvent(`**[MEDIA DELETED]** clip deleted by <@${interaction.user.id}>${uploader ? ` — posted by <@${uploader}>` : ''}`);
+        return interaction.reply({
+          content: `Clip deleted.${uploader ? ` Posted by <@${uploader}>, use /mediaban to ban them.` : ''}`,
+          ephemeral: true,
+        });
+      }
+
       // announcement confirm / cancel: anc_<action>_<draft id>
       if (interaction.customId.startsWith('anc_')) {
         return await handleAncButton(interaction);
@@ -938,6 +1039,8 @@ client.on('interactionCreate', async (interaction) => {
   const admin = `<@${interaction.user.id}>`;
 
   try {
+    if (await adminExtras.handle(interaction)) return;
+
     if (commandName === 'addkey') {
       const duration = options.getInteger('duration');
       const key = genKey();
@@ -1000,7 +1103,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (commandName === 'listkeys') {
       const { rows } = await pool.query(
-        'SELECT key_value, hwid, discord_id, expires_at FROM keys ORDER BY created_at DESC'
+        'SELECT key_value, hwid, discord_id, expires_at, frozen FROM keys ORDER BY created_at DESC'
       );
 
       if (!rows.length) {
@@ -1008,7 +1111,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const lines = rows.map(r => {
-        const status = new Date(r.expires_at) < new Date() ? 'EXPIRED' : 'active';
+        const status = r.frozen ? 'FROZEN' : new Date(r.expires_at) < new Date() ? 'EXPIRED' : 'active';
         const hwid = r.hwid ? `\`${r.hwid}\`` : '*not locked yet*';
         const owner = r.discord_id ? `<@${r.discord_id}>` : '*unclaimed*';
         return `\`${r.key_value}\` — owner: ${owner} — hwid: ${hwid} — ${status} (until ${new Date(r.expires_at).toISOString().slice(0, 10)})`;
